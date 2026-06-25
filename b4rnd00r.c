@@ -102,7 +102,6 @@ struct linux_dirent64 {
 static inline void
 tlb_flush_hard(void)
 {
-    write_cr3(virt_to_phys(current->mm->pgd));
     __flush_tlb_all();
 }
 
