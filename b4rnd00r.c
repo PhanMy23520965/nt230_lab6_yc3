@@ -102,7 +102,9 @@ struct linux_dirent64 {
 static inline void
 tlb_flush_hard(void)
 {
-    write_cr3(virt_to_phys(current->mm->pgd));
+    /* KHÔNG dùng write_cr3: current->mm có thể NULL trong kernel context
+     * => gây kernel panic / VM freeze ngay sau insmod.
+     * __flush_tlb_all() là đủ để invalidate TLB sau khi đổi page protection. */
     __flush_tlb_all();
 }
 
